@@ -50,16 +50,18 @@ function fastifySecureSession (fastify, options, next) {
   for (const sessionOptions of options) {
     const sessionName = sessionOptions.sessionName || 'session'
     const cookieName = sessionOptions.cookieName || sessionName
+    const expiry = sessionOptions.expiry || 86401 // 24 hours
     const cookieOptions = sessionOptions.cookieOptions || sessionOptions.cookie || {}
 
+    if (cookieOptions.httpOnly === undefined) {
+      cookieOptions.httpOnly = true
+    }
+
     let key
-    if (sessionOptions.secret) {
+
+    if (sessionOptions.secret && !sessionOptions.key) {
       if (Buffer.byteLength(sessionOptions.secret) < 32) {
         return next(new Error('secret must be at least 32 bytes'))
-      }
-
-      if (!defaultSecret) {
-        defaultSecret = sessionOptions.secret
       }
 
       key = Buffer.allocUnsafe(sodium.crypto_secretbox_KEYBYTES)
@@ -82,6 +84,8 @@ function fastifySecureSession (fastify, options, next) {
         sodium.crypto_pwhash_OPSLIMIT_MODERATE,
         sodium.crypto_pwhash_MEMLIMIT_MODERATE,
         sodium.crypto_pwhash_ALG_DEFAULT)
+
+      defaultSecret = sessionOptions.secret
     }
 
     if (sessionOptions.key) {
@@ -103,6 +107,16 @@ function fastifySecureSession (fastify, options, next) {
       } else if (Array.isArray(key) && key.every(isBufferKeyLengthInvalid)) {
         return next(new Error(`key lengths must be ${sodium.crypto_secretbox_KEYBYTES} bytes`))
       }
+
+      const outputHash = Buffer.alloc(sodium.crypto_generichash_BYTES)
+
+      if (Array.isArray(key)) {
+        sodium.crypto_generichash(outputHash, key[0])
+      } else {
+        sodium.crypto_generichash(outputHash, key)
+      }
+
+      defaultSecret = outputHash.toString('hex')
     }
 
     if (!key) {
@@ -120,7 +134,8 @@ function fastifySecureSession (fastify, options, next) {
     sessionNames.set(sessionName, {
       cookieName,
       cookieOptions,
-      key
+      key,
+      expiry
     })
 
     if (!defaultSessionName) {
@@ -139,7 +154,7 @@ function fastifySecureSession (fastify, options, next) {
       throw new Error('Unknown session key.')
     }
 
-    const { key } = sessionNames.get(sessionName)
+    const { key, expiry } = sessionNames.get(sessionName)
 
     // do not use destructuring or it will deopt
     const split = cookie.split(';')
@@ -184,8 +199,15 @@ function fastifySecureSession (fastify, options, next) {
       return null
     }
 
+    const parsed = JSON.parse(msg)
+    if ((parsed.__ts + expiry) * 1000 - Date.now() <= 0) {
+      // maximum validity is reached, resetting
+      log.debug('@fastify/secure-session: expiry reached')
+      return null
+    }
     const session = new Proxy(new Session(JSON.parse(msg)), sessionProxyHandler)
     session.changed = signingKeyRotated
+
     return session
   })
 
@@ -228,7 +250,7 @@ function fastifySecureSession (fastify, options, next) {
         const cookie = request.cookies[cookieName]
         const result = fastify.decodeSecureSession(cookie, request.log, sessionName)
 
-        request[sessionName] = new Proxy((result || new Session({})), sessionProxyHandler)
+        request[sessionName] = result || new Proxy(new Session({}), sessionProxyHandler)
       }
 
       next()
@@ -275,6 +297,10 @@ class Session {
     this[kCookieOptions] = null
     this.changed = false
     this.deleted = false
+
+    if (this[kObj].__ts === undefined) {
+      this[kObj].__ts = Math.round(Date.now() / 1000)
+    }
   }
 
   get (key) {
@@ -296,7 +322,12 @@ class Session {
   }
 
   data () {
-    return this[kObj]
+    const copy = {
+      ...this[kObj]
+    }
+
+    delete copy.__ts
+    return copy
   }
 
   touch () {
